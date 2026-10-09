@@ -2,7 +2,7 @@ import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
-const API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const API_URL = (import.meta.env.VITE_API_URL || "https://musicplaylist-qz0p.onrender.com").replace(/\/$/, "");
 const apiUrl = (path) => `${API_URL}${path}`;
 
 function getYouTubeId(value) {
