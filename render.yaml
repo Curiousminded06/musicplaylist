@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: soundboard-api
+    runtime: node
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/playlists
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        sync: false
+    disk:
+      name: soundboard-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1
