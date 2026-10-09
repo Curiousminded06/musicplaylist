@@ -39,9 +39,23 @@ if (!defaultPlaylist) {
   database.prepare("INSERT INTO playlists (name, created_at) VALUES (?, ?)").run("My collection", new Date().toISOString());
 }
 
+const configuredOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((url) => url.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(",").map((url) => url.trim()) : true
+  origin(origin, callback) {
+    if (!origin || configuredOrigins.length === 0 || configuredOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`CORS origin not allowed: ${origin}`));
+  },
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
 }));
+app.options("*", cors());
 app.use(express.json());
 
 function getPlaylist(id) {
@@ -144,6 +158,8 @@ app.delete("/api/playlists/:playlistId/songs/:songId", (req, res) => {
   if (!result.changes) return res.status(404).json({ message: "Song not found." });
   return res.status(204).send();
 });
+
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
 app.get("/api/playlist", (_req, res) => {
   const playlist = database.prepare("SELECT id FROM playlists ORDER BY id LIMIT 1").get();
