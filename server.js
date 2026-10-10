@@ -2,42 +2,21 @@ import express from "express";
 import cors from "cors";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import Database from "better-sqlite3";
+import { MongoClient, ObjectId } from "mongodb";
 
 const app = express();
 const port = process.env.PORT || 3001;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const database = new Database(path.join(__dirname, "soundboard.db"));
+const mongoUri = process.env.MONGODB_URI;
+const mongoDatabaseName = process.env.MONGODB_DB || "soundboard";
 
-database.exec(`
-  CREATE TABLE IF NOT EXISTS playlists (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS songs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    url TEXT NOT NULL,
-    video_id TEXT,
-    media_type TEXT NOT NULL DEFAULT 'youtube',
-    favorite INTEGER NOT NULL DEFAULT 0,
-    position INTEGER NOT NULL DEFAULT 0,
-    added_at TEXT NOT NULL
-  );
-`);
-database.pragma("foreign_keys = ON");
-try {
-  database.exec("ALTER TABLE songs ADD COLUMN position INTEGER NOT NULL DEFAULT 0");
-} catch (error) {
-  if (!String(error.message).includes("duplicate column name")) throw error;
+if (!mongoUri) {
+  throw new Error("MONGODB_URI is required. Set it in Render environment variables.");
 }
 
-const defaultPlaylist = database.prepare("SELECT id FROM playlists ORDER BY id LIMIT 1").get();
-if (!defaultPlaylist) {
-  database.prepare("INSERT INTO playlists (name, created_at) VALUES (?, ?)").run("My collection", new Date().toISOString());
-}
+const mongoClient = new MongoClient(mongoUri);
+let playlists;
+let songs;
 
 const configuredOrigins = (process.env.FRONTEND_URL || "")
   .split(",")
@@ -58,112 +37,144 @@ app.use(cors({
 app.options("*", cors());
 app.use(express.json());
 
-function getPlaylist(id) {
-  return database.prepare("SELECT id, name FROM playlists WHERE id = ?").get(id);
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-function getSongs(playlistId) {
-  return database.prepare(`
-    SELECT id, title, url, video_id AS videoId, media_type AS mediaType,
-      favorite = 1 AS favorite, added_at AS addedAt
-    FROM songs
-    WHERE playlist_id = ?
-    ORDER BY favorite DESC, position ASC, id ASC
-  `).all(playlistId);
+function objectId(value) {
+  return ObjectId.isValid(value) ? new ObjectId(value) : null;
 }
 
-app.get("/api/playlists", (_req, res) => {
-  res.json(database.prepare(`
-    SELECT p.id, p.name, COUNT(s.id) AS songCount
-    FROM playlists p LEFT JOIN songs s ON s.playlist_id = p.id
-    GROUP BY p.id ORDER BY p.id ASC
-  `).all());
-});
+function serializePlaylist(playlist, songCount = 0) {
+  return { id: playlist._id.toString(), name: playlist.name, songCount };
+}
 
-app.patch("/api/playlists/:playlistId/order", (req, res) => {
-  const playlistId = Number(req.params.playlistId);
-  const songIds = Array.isArray(req.body.songIds) ? req.body.songIds.map(Number) : [];
-  const existing = database.prepare("SELECT id FROM songs WHERE playlist_id = ?").all(playlistId).map((song) => song.id);
-  if (!getPlaylist(playlistId) || songIds.length !== existing.length || songIds.some((id) => !existing.includes(id))) {
-    return res.status(400).json({ message: "Invalid playlist order." });
-  }
-  const update = database.prepare("UPDATE songs SET position = ? WHERE id = ? AND playlist_id = ?");
-  const transaction = database.transaction(() => {
-    songIds.forEach((id, index) => update.run(index, id, playlistId));
-  });
-  transaction();
-  return res.json(getSongs(playlistId));
-});
+function serializeSong(song) {
+  return {
+    id: song._id.toString(),
+    title: song.title,
+    url: song.url,
+    videoId: song.videoId || null,
+    mediaType: song.mediaType,
+    favorite: Boolean(song.favorite),
+    addedAt: song.addedAt
+  };
+}
 
-app.post("/api/playlists", (req, res) => {
+async function getPlaylist(id) {
+  const playlistId = objectId(id);
+  return playlistId ? playlists.findOne({ _id: playlistId }) : null;
+}
+
+async function getSongs(playlistId) {
+  return (await songs.find({ playlistId }).sort({ favorite: -1, position: 1, addedAt: 1 }).toArray()).map(serializeSong);
+}
+
+app.get("/api/playlists", asyncRoute(async (_req, res) => {
+  const items = await playlists.find().sort({ createdAt: 1 }).toArray();
+  const result = await Promise.all(items.map(async (item) => {
+    const songCount = await songs.countDocuments({ playlistId: item._id });
+    return serializePlaylist(item, songCount);
+  }));
+  res.json(result);
+}));
+
+app.post("/api/playlists", asyncRoute(async (req, res) => {
   const name = String(req.body.name || "").trim();
   if (!name) return res.status(400).json({ message: "Playlist name is required." });
-  const result = database.prepare("INSERT INTO playlists (name, created_at) VALUES (?, ?)").run(name, new Date().toISOString());
-  return res.status(201).json({ id: Number(result.lastInsertRowid), name, songCount: 0 });
-});
+  const playlist = { name, createdAt: new Date() };
+  const result = await playlists.insertOne(playlist);
+  res.status(201).json(serializePlaylist({ ...playlist, _id: result.insertedId }));
+}));
 
-app.patch("/api/playlists/:playlistId", (req, res) => {
-  const playlist = getPlaylist(Number(req.params.playlistId));
+app.patch("/api/playlists/:playlistId", asyncRoute(async (req, res) => {
+  const playlist = await getPlaylist(req.params.playlistId);
   const name = String(req.body.name || "").trim();
   if (!playlist) return res.status(404).json({ message: "Playlist not found." });
   if (!name) return res.status(400).json({ message: "Playlist name is required." });
-  database.prepare("UPDATE playlists SET name = ? WHERE id = ?").run(name, playlist.id);
-  return res.json({ ...playlist, name });
-});
+  await playlists.updateOne({ _id: playlist._id }, { $set: { name } });
+  res.json(serializePlaylist({ ...playlist, name }, await songs.countDocuments({ playlistId: playlist._id })));
+}));
 
-app.delete("/api/playlists/:playlistId", (req, res) => {
-  const playlistId = Number(req.params.playlistId);
-  const playlists = database.prepare("SELECT id FROM playlists ORDER BY id").all();
-  if (playlists.length <= 1) return res.status(400).json({ message: "Keep at least one playlist." });
-  const result = database.prepare("DELETE FROM playlists WHERE id = ?").run(playlistId);
-  if (!result.changes) return res.status(404).json({ message: "Playlist not found." });
-  return res.status(204).send();
-});
+app.delete("/api/playlists/:playlistId", asyncRoute(async (req, res) => {
+  const count = await playlists.countDocuments();
+  if (count <= 1) return res.status(400).json({ message: "Keep at least one playlist." });
+  const playlistId = objectId(req.params.playlistId);
+  const result = await playlists.deleteOne({ _id: playlistId });
+  if (!result.deletedCount) return res.status(404).json({ message: "Playlist not found." });
+  await songs.deleteMany({ playlistId });
+  res.status(204).send();
+}));
 
-app.get("/api/playlists/:playlistId/songs", (req, res) => {
-  if (!getPlaylist(Number(req.params.playlistId))) return res.status(404).json({ message: "Playlist not found." });
-  return res.json(getSongs(Number(req.params.playlistId)));
-});
+app.get("/api/playlists/:playlistId/songs", asyncRoute(async (req, res) => {
+  const playlist = await getPlaylist(req.params.playlistId);
+  if (!playlist) return res.status(404).json({ message: "Playlist not found." });
+  res.json(await getSongs(playlist._id));
+}));
 
-app.post("/api/playlists/:playlistId/songs", (req, res) => {
-  const playlistId = Number(req.params.playlistId);
+app.post("/api/playlists/:playlistId/songs", asyncRoute(async (req, res) => {
+  const playlist = await getPlaylist(req.params.playlistId);
   const { title, url, videoId, mediaType = "youtube" } = req.body;
-  if (!getPlaylist(playlistId)) return res.status(404).json({ message: "Playlist not found." });
+  if (!playlist) return res.status(404).json({ message: "Playlist not found." });
   if (!title || !url || (mediaType === "youtube" && !videoId)) {
     return res.status(400).json({ message: "A song title and valid media link are required." });
   }
-  const addedAt = new Date().toISOString();
-  const result = database.prepare(`
-    INSERT INTO songs (playlist_id, title, url, video_id, media_type, added_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(playlistId, title.trim(), url, videoId || null, mediaType, addedAt);
-  return res.status(201).json(database.prepare(`
-    SELECT id, title, url, video_id AS videoId, media_type AS mediaType,
-      favorite = 1 AS favorite, added_at AS addedAt
-    FROM songs WHERE id = ?
-  `).get(result.lastInsertRowid));
-});
+  const song = {
+    playlistId: playlist._id,
+    title: title.trim(),
+    url,
+    videoId: videoId || null,
+    mediaType,
+    favorite: false,
+    position: await songs.countDocuments({ playlistId: playlist._id }),
+    addedAt: new Date()
+  };
+  const result = await songs.insertOne(song);
+  res.status(201).json(serializeSong({ ...song, _id: result.insertedId }));
+}));
 
-app.patch("/api/playlists/:playlistId/songs/:songId", (req, res) => {
-  const favorite = req.body.favorite ? 1 : 0;
-  const result = database.prepare("UPDATE songs SET favorite = ? WHERE id = ? AND playlist_id = ?")
-    .run(favorite, Number(req.params.songId), Number(req.params.playlistId));
-  if (!result.changes) return res.status(404).json({ message: "Song not found." });
-  return res.json({ favorite: Boolean(favorite) });
-});
+app.patch("/api/playlists/:playlistId/songs/:songId", asyncRoute(async (req, res) => {
+  const playlistId = objectId(req.params.playlistId);
+  const songId = objectId(req.params.songId);
+  const favorite = Boolean(req.body.favorite);
+  const result = await songs.updateOne({ _id: songId, playlistId }, { $set: { favorite } });
+  if (!result.matchedCount) return res.status(404).json({ message: "Song not found." });
+  res.json({ favorite });
+}));
 
-app.delete("/api/playlists/:playlistId/songs/:songId", (req, res) => {
-  const result = database.prepare("DELETE FROM songs WHERE id = ? AND playlist_id = ?")
-    .run(Number(req.params.songId), Number(req.params.playlistId));
-  if (!result.changes) return res.status(404).json({ message: "Song not found." });
-  return res.status(204).send();
-});
+app.patch("/api/playlists/:playlistId/order", asyncRoute(async (req, res) => {
+  const playlistId = objectId(req.params.playlistId);
+  const songIds = Array.isArray(req.body.songIds) ? req.body.songIds : [];
+  const existing = await songs.find({ playlistId }, { projection: { _id: 1 } }).toArray();
+  const existingIds = new Set(existing.map((song) => song._id.toString()));
+  if (!playlistId || songIds.length !== existing.length || songIds.some((id) => !existingIds.has(String(id)))) {
+    return res.status(400).json({ message: "Invalid playlist order." });
+  }
+  await Promise.all(songIds.map((id, position) =>
+    songs.updateOne({ _id: objectId(id), playlistId }, { $set: { position } })
+  ));
+  res.json(await getSongs(playlistId));
+}));
+
+app.delete("/api/playlists/:playlistId/songs/:songId", asyncRoute(async (req, res) => {
+  const result = await songs.deleteOne({
+    _id: objectId(req.params.songId),
+    playlistId: objectId(req.params.playlistId)
+  });
+  if (!result.deletedCount) return res.status(404).json({ message: "Song not found." });
+  res.status(204).send();
+}));
 
 app.get("/favicon.ico", (_req, res) => res.status(204).end());
 
-app.get("/api/playlist", (_req, res) => {
-  const playlist = database.prepare("SELECT id FROM playlists ORDER BY id LIMIT 1").get();
-  res.json(getSongs(playlist.id));
+app.get("/api/playlist", asyncRoute(async (_req, res) => {
+  const playlist = await playlists.findOne({}, { sort: { createdAt: 1 } });
+  res.json(playlist ? await getSongs(playlist._id) : []);
+}));
+
+app.use((error, _req, res, _next) => {
+  console.error(error);
+  res.status(500).json({ message: "The server could not complete that request." });
 });
 
 if (process.env.NODE_ENV === "production") {
@@ -171,4 +182,20 @@ if (process.env.NODE_ENV === "production") {
   app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
 }
 
-app.listen(port, () => console.log(`Playlist API running at http://localhost:${port}`));
+async function start() {
+  await mongoClient.connect();
+  const database = mongoClient.db(mongoDatabaseName);
+  playlists = database.collection("playlists");
+  songs = database.collection("songs");
+  await playlists.createIndex({ createdAt: 1 });
+  await songs.createIndex({ playlistId: 1, favorite: -1, position: 1 });
+  if (await playlists.countDocuments() === 0) {
+    await playlists.insertOne({ name: "My collection", createdAt: new Date() });
+  }
+  app.listen(port, () => console.log(`Playlist API running at http://localhost:${port}`));
+}
+
+start().catch((error) => {
+  console.error("Could not connect to MongoDB:", error);
+  process.exit(1);
+});
